@@ -3,3 +3,6 @@
 .venv/
 venv/
 .vscode/
+household_power_consumption.txt
+backend/energy.db
+.DS_Store
