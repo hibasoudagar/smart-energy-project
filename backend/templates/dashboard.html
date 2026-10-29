@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Energy Dashboard</title>
+<script src="/static/chart.umd.js"></script>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --ink:#1d2433; --muted:#6b7385; --line:#e3e6ec;
+          --accent:#2563eb; --good:#16a34a; --bad:#dc2626; --warn:#d97706; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         background:var(--bg); color:var(--ink); }
+  header { padding:20px 24px 8px; display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:8px; }
+  h1 { font-size:20px; margin:0; }
+  .sub { color:var(--muted); font-size:13px; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
+  main { padding:8px 24px 32px; display:grid; gap:16px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); gap:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  .value { font-size:30px; font-weight:650; margin-top:6px; font-variant-numeric:tabular-nums; }
+  .unit { font-size:15px; color:var(--muted); font-weight:500; }
+  .note { font-size:12.5px; color:var(--muted); margin-top:4px; }
+  .status-ok { color:var(--good); } .status-alert { color:var(--bad); }
+  .row { display:grid; grid-template-columns:2fr 1fr; gap:16px; }
+  @media (max-width: 860px) { .row { grid-template-columns:1fr; } }
+  .controls button { font:inherit; font-size:13px; padding:7px 12px; margin:4px 4px 0 0; border-radius:7px;
+                     border:1px solid var(--line); background:#fff; cursor:pointer; }
+  .controls button.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .controls button.danger { border-color:var(--bad); color:var(--bad); }
+  .controls input { font:inherit; width:90px; padding:6px 8px; border:1px solid var(--line); border-radius:7px; }
+  .controls section { margin-bottom:16px; }
+  h2 { font-size:14px; margin:0 0 10px; }
+  .chartbox { position:relative; height:260px; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Smart Energy Dashboard</h1>
+    <div class="sub">IoT & AI-Powered Energy Consumption Prediction and Control</div>
+  </div>
+  <div class="sub" id="device"><span class="dot" style="background:#aaa"></span>Waiting for data…</div>
+</header>
+
+<main>
+  <div class="cards">
+    <div class="card"><div class="label">Current power</div>
+      <div class="value" id="now-w">–</div><div class="note" id="now-detail">&nbsp;</div></div>
+    <div class="card"><div class="label">Predicted next hour</div>
+      <div class="value" id="pred-w">–</div><div class="note" id="pred-detail">&nbsp;</div></div>
+    <div class="card"><div class="label">Typical power (24 h avg)</div>
+      <div class="value" id="typ-w">–</div><div class="note">Model scales its prediction by this</div></div>
+    <div class="card"><div class="label">Status</div>
+      <div class="value" id="status">–</div><div class="note" id="relay-note">&nbsp;</div></div>
+  </div>
+
+  <div class="row">
+    <div class="card"><h2>Power, last 24 hours (5-min average)</h2>
+      <div class="chartbox"><canvas id="powerChart"></canvas></div></div>
+
+    <div class="card controls">
+      <section><h2>Alert threshold</h2>
+        <input id="threshold" type="number" min="0" step="5"> W
+        <button onclick="saveThreshold()">Save</button>
+        <div class="note">Alert when predicted next hour exceeds this.</div></section>
+      <section><h2>Appliance (relay)</h2>
+        <button id="mode-auto" onclick="setMode('auto')">Auto</button>
+        <button id="mode-on" onclick="setMode('on')">Force ON</button>
+        <button id="mode-off" onclick="setMode('off')">Force OFF</button>
+        <div class="note">Auto: switches off when an alert fires and stays off until reset.</div>
+        <button class="danger" id="reset" onclick="resetTrip()" style="display:none">Reset trip &amp; turn ON</button></section>
+      <section><h2>Data</h2>
+        <a href="/export.csv">Download readings (CSV)</a><br>
+        <a href="/evaluation.csv">Download predicted vs actual (CSV)</a></section>
+    </div>
+  </div>
+
+  <div class="card"><h2>Model check: predicted vs actual (each completed hour)</h2>
+    <div class="note" id="eval-summary">Appears once the first prediction is 1 hour old.</div>
+    <div class="chartbox"><canvas id="evalChart"></canvas></div></div>
+</main>
+
+<script>
+const fmt = w => w == null ? "–" : `${w.toFixed(w < 10 ? 2 : 1)}<span class="unit"> W</span>`;
+const hhmm = t => t.slice(11, 16);
+let powerChart, evalChart, thresholdLoaded = false;
+
+function makeChart(id, datasets) {
+  if (typeof Chart === "undefined") return null;   // charts missing: cards still work
+  return new Chart(document.getElementById(id), {
+    type: "line", data: { labels: [], datasets },
+    options: { animation: false, maintainAspectRatio: false, interaction: { mode: "index", intersect: false },
+      scales: { y: { beginAtZero: true, title: { display: true, text: "W" } },
+                x: { ticks: { maxTicksLimit: 12 } } },
+      plugins: { legend: { labels: { boxWidth: 12 } } } }
+  });
+}
+
+async function refreshStatus() {
+  const s = await (await fetch("/api/status")).json();
+  const p = s.prediction, set = s.settings;
+  document.getElementById("device").innerHTML =
+    `<span class="dot" style="background:${s.online ? "var(--good)" : "var(--bad)"}"></span>` +
+    (s.online ? "Device online" : "Device offline") +
+    (s.last_reading ? ` · last reading ${hhmm(s.last_reading.ts)}` : "");
+  const lr = s.last_reading;
+  document.getElementById("now-w").innerHTML = fmt(lr ? lr.power_w : null);
+  document.getElementById("now-detail").textContent =
+    lr && lr.voltage ? `${lr.voltage} V · ${lr.current_a ?? "–"} A` : " ";
+  document.getElementById("pred-w").innerHTML = fmt(p.predicted_w);
+  document.getElementById("pred-detail").textContent = p.predicted_w == null ? p.reason : `Method: ${p.method}`;
+  document.getElementById("typ-w").innerHTML = fmt(p.typical_w ?? null);
+  const st = document.getElementById("status");
+  st.textContent = s.alert ? "⚠ ALERT" : (p.predicted_w == null ? "Waiting" : "Normal");
+  st.className = "value " + (s.alert ? "status-alert" : "status-ok");
+  document.getElementById("relay-note").textContent =
+    `Relay ${s.relay.toUpperCase()}` + (set.tripped ? " (tripped by alert)" : "") + ` · threshold ${set.threshold_w} W`;
+  ["auto", "on", "off"].forEach(m =>
+    document.getElementById("mode-" + m).classList.toggle("active", set.relay_mode === m));
+  document.getElementById("reset").style.display = set.tripped ? "inline-block" : "none";
+  if (!thresholdLoaded) { document.getElementById("threshold").value = set.threshold_w; thresholdLoaded = true; }
+  window._threshold = set.threshold_w;
+}
+
+async function refreshHistory() {
+  const h = await (await fetch("/api/history?hours=24")).json();
+  const e = h.evaluation;
+  if (e.count) document.getElementById("eval-summary").textContent =
+    `${e.count} predictions checked · MAE ${e.mae_w} W · RMSE ${e.rmse_w} W`;
+  if (!powerChart) return;
+  powerChart.data.labels = h.power.map(r => hhmm(r.t));
+  powerChart.data.datasets[0].data = h.power.map(r => r.w);
+  powerChart.data.datasets[1].data = h.power.map(() => window._threshold);
+  powerChart.update();
+  evalChart.data.labels = e.points.map(r => hhmm(r.t));
+  evalChart.data.datasets[0].data = e.points.map(r => r.actual_w);
+  evalChart.data.datasets[1].data = e.points.map(r => r.predicted_w);
+  evalChart.update();
+}
+
+async function post(body) {
+  await fetch("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" },
+                                  body: JSON.stringify(body) });
+  refreshStatus();
+}
+const saveThreshold = () => post({ threshold_w: parseFloat(document.getElementById("threshold").value) });
+const setMode = m => post({ relay_mode: m });
+const resetTrip = () => post({ reset_trip: true, relay_mode: "auto" });
+
+powerChart = makeChart("powerChart", [
+  { label: "Power (W)", data: [], borderColor: "#2563eb", backgroundColor: "rgba(37,99,235,.08)",
+    fill: true, pointRadius: 0, borderWidth: 1.5 },
+  { label: "Threshold", data: [], borderColor: "#dc2626", borderDash: [5, 4], pointRadius: 0, borderWidth: 1 }]);
+evalChart = makeChart("evalChart", [
+  { label: "Actual hour average (W)", data: [], borderColor: "#1d2433", pointRadius: 2, borderWidth: 2 },
+  { label: "Predicted (W)", data: [], borderColor: "#d97706", pointRadius: 2, borderWidth: 1.5 }]);
+
+async function tick() { try { await refreshStatus(); await refreshHistory(); } catch (e) { console.log(e); } }
+tick(); setInterval(tick, 10000);
+</script>
+</body>
+</html>
